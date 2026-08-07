@@ -41,6 +41,8 @@
 # to launch a ship task whose explicit --mode disagrees, so an adjusted brief and the
 # recorded task metadata cannot drift apart.
 # Ship briefs begin with a worktree-isolation assertion before the branch step.
+# The two PR-producing modes also carry the PR description contract: the plain-English
+# outcome leads, caveats follow it. local-only and scout briefs omit it (no PR).
 # --mode is refused on scout and secondmate scaffolds: a scout's deliverable is a
 # report rather than a merge, and a charter is not a delivery contract.
 # There is no --yolo flag here. The worker never owns approval decisions, so yolo is
@@ -347,6 +349,20 @@ echo "scaffolded: $BRIEF (scout; replace {TASK})"
 exit 0
 fi
 
+# PR description contract, generated only for the two modes that produce a PR.
+# The reviewer who decides whether to merge reads the top of the description
+# first and has not read the task plan, so the plain-English outcome leads and
+# every caveat keeps its full detail below it.
+IFS= read -r -d '' PR_DESC <<'EOF' || true
+
+Write the PR description for a reader who has not read the plan.
+Open with one plain-English sentence saying what this change lets us do that we could not do before - no plan, stream, or phase references, no file names, no jargon in that sentence.
+Follow it with one line on what the change deliberately does not do, where that is a live question.
+Everything else - caveats, discoveries, unverified assumptions, reviewer notes - keeps its full detail below those lines; that material moves down, it is never cut.
+The test: someone who has not read the plan knows from the first two lines alone what changed and why they should care.
+EOF
+PR_DESC=${PR_DESC%$'\n'}
+
 # Ship task: shape Setup / Rule 1 / Definition of done by this task's explicit
 # delivery mode, validated above. The generated DOD opens with the fixed
 # "Delivery contract: mode=<mode>" line that bin/fm-spawn.sh checks against its own
@@ -362,6 +378,7 @@ This task ships **direct-PR**: you raise the PR yourself, without the no-mistake
 The task is complete only when committed on your branch.
 When it is implemented and committed, push your branch and open a PR with \`gh-axi\`, then append \`done: PR {url}\` to the status file and stop.
 Do NOT run /no-mistakes. The configured merge authority decides whether to merge the PR; firstmate relays the outcome.
+$PR_DESC
 EOF
     ;;
   local-only)
@@ -398,6 +415,7 @@ Two firstmate-specific rules layer on top of that guidance:
   Firstmate applies the authority contract in its \`AGENTS.md\` and obtains any required captain decision.
   When the decision comes back, feed it to the gate with \`no-mistakes axi respond\` and let the pipeline apply it - do not route the question to "the user" or implement the fix yourself.
 - Avoid \`--yes\`: it would silently bypass firstmate's authority check and any required captain escalation.
+$PR_DESC
 
 After /no-mistakes reports CI green (the CI-ready return point - do not wait for it to keep monitoring in the background until merge), append \`done: PR {url} checks green\` and stop. You are finished.
 EOF
