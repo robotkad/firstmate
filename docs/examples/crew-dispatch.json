@@ -17,6 +17,16 @@
         { "harness": "codex", "model": "gpt-5.5", "effort": "high" }
       ],
       "why": "Use a strong coding profile for big, ambiguous work; resolve the alternatives through quota-array-dispatch."
+    },
+    {
+      "when": "The task is everyday coding where turnaround time matters more than depth of reasoning.",
+      "use": { "harness": "codex", "model": "gpt-5.5", "effort": "medium", "service_tier": "priority" },
+      "why": "Buy codex's paid speed tier where finishing sooner is the point."
+    },
+    {
+      "when": "The task is reasoning-heavy architecture, design, or review work rather than fast iteration.",
+      "use": { "harness": "codex", "model": "gpt-5.5", "effort": "xhigh", "service_tier": "default" },
+      "why": "Selecting the baseline tier explicitly is what turns a codex service tier off; omitting the field would inherit whatever the operator's own codex config sets."
     }
   ],
   "default": [
