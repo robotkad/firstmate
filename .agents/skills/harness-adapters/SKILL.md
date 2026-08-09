@@ -11,7 +11,7 @@ metadata:
 Use this reference before any harness-specific firstmate operation: spawn, recovery, trust-dialog handling, skill invocation, interrupt, exit, resume, or adapter verification.
 
 Crewmates default to the same harness firstmate is running on unless `config/crew-harness` records an adapter name.
-Optional dispatch profiles in `config/crew-dispatch.json` can override that static default for one crewmate or scout dispatch by selecting concrete harness, model, and effort axes at intake.
+Optional dispatch profiles in `config/crew-dispatch.json` can override that static default for one crewmate or scout dispatch by selecting concrete harness, model, effort, and service-tier axes at intake.
 When a matched rule or default is a profile array, load `quota-array-dispatch` for the completion-aware candidate choice after this skill establishes harness and model/provider facts.
 The captain may override that file at session start or later; a per-task instruction such as "run this one on codex" overrides it for that dispatch only.
 `default` means mirror firstmate's own harness.
@@ -104,7 +104,7 @@ When changing any primary watcher adapter, update `docs/supervision-protocols/`,
 
 ## Launch profile axes
 
-`bin/fm-spawn.sh` accepts concrete `--harness`, `--model`, and `--effort` values chosen by firstmate at intake.
+`bin/fm-spawn.sh` accepts concrete `--harness`, `--model`, `--effort`, and `--service-tier` values chosen by firstmate at intake.
 Do not make the shell scripts parse or match natural-language dispatch rules.
 
 Effort precedence is an explicit per-task captain instruction first, then any applicable standing dispatch profile or secondmate pin, then the generic fallback below.
@@ -120,7 +120,7 @@ The supported launch-profile flags below are verified locally; each row records 
 | Harness | Model flag | Effort flag | Notes |
 |---|---|---|---|
 | claude | `--model <model>` | `--effort <low\|medium\|high\|xhigh\|max>` | Verified on Claude Code 2.1.196. |
-| codex | `--model <model>` | `-c 'model_reasoning_effort="<low\|medium\|high\|xhigh>"'` | Verified on codex-cli 0.142.1. The installed binary schema contains `model_reasoning_effort`, the active config uses it, and the bundled model catalog advertises only low/medium/high/xhigh. `max` is omitted. |
+| codex | `--model <model>` | `-c 'model_reasoning_effort="<low\|medium\|high\|xhigh>"'`, and `max` only when the catalog advertises it for that model | Re-verified 2026-08-09 on codex-cli 0.145.0 against catalog client_version 0.146.0, correcting a 0.142.1-era row that recorded a flat `xhigh` ceiling. Codex's accepted set is per-MODEL, not per-harness: low/medium/high/xhigh are advertised by every catalog model, while `max` is advertised by only some. Codex does not validate this axis - it forwards the value and the API answers an unsupported one with HTTP 400 `unsupported_value` on `reasoning.effort`, killing the run - so `fm-spawn` proves `max` against `codex debug models` for the requested model and omits it whenever that is unprovable. Codex also has an `ultra` level above the shared vocabulary; like muse's sub-vocabulary levels it stays unreachable. |
 | grok | `--model <model>` | `--reasoning-effort <low\|medium\|high>` | Verified on grok 0.2.99 (2026-07-13). `--effort` is an alias, but firstmate's profile axis is reasoning effort. As of 0.2.99 the ceiling is `high`; both `xhigh` and `max` are rejected with `use one of: high, medium, low`, so firstmate omits them. |
 | pi / pi-signed | `--model <model>` | `--thinking <low\|medium\|high\|xhigh\|max>` | Verified 2026-07-27 on Pi and pi-signed 0.82.0. Both expose the same accepted thinking levels and completed the same model-qualified max-thinking smoke. |
 | opencode | `--model <provider/model>` | none for firstmate's interactive launch | Verified on opencode 1.17.6. `opencode run` has `--variant`, but firstmate launches the interactive `opencode --prompt` path, which has no verified effort flag. |
@@ -150,6 +150,20 @@ A discovery surface you could not reach establishes nothing; report that as unce
 
 When a requested effort value is outside the harness-specific accepted set, `fm-spawn` records the requested `effort=` in meta but emits no effort flag for that harness.
 This preserves launch success instead of passing a known-bad value.
+
+### Service tier
+
+A service tier is a paid speed setting and is a codex concept today; every other harness records the requested value in meta and receives no flag.
+`bin/fm-spawn.sh --service-tier <default|priority>` owns the flag and `docs/configuration.md` owns the matching dispatch-profile field.
+
+This axis inverts the omission rule the other axes follow, so reason about it separately.
+A service tier configured in the operator's own `~/.codex/config.toml` is inherited by every codex agent firstmate launches, so passing no flag does not mean the tier is off - it means whatever the operator set.
+Turning the tier off therefore requires sending `default`, codex's own baseline tier id, rather than omitting the flag.
+Choose `priority` for fast everyday coding and `default` for reasoning-heavy architecture and review work, where paying for speed buys nothing.
+
+Verified 2026-08-09 on codex-cli 0.145.0 against catalog client_version 0.146.0.
+Codex resolves this axis against the model's advertised `service_tiers` plus a special-cased `default`: a tier the model does not advertise is dropped with `Configured service tier ... will be omitted from requests` and the run continues, while `default` is accepted with no warning even for a model that advertises no tiers at all.
+That makes an unsupported tier degrade to baseline speed rather than fail, which is why `fm-spawn` validates the pair statically instead of consulting the catalog the way it must for `max`.
 
 ## no-mistakes skill invocation
 

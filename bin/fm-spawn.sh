@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Spawn a direct report: a crewmate in a treehouse or Orca worktree, or a
 # secondmate in its isolated firstmate home.
-# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>]
-#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--backend <name>] --secondmate
+# Usage: fm-spawn.sh <task-id> <project-dir> --mode <no-mistakes|direct-PR|local-only> --yolo <on|off> [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--service-tier <tier>] [--backend <name>]
+#        fm-spawn.sh <task-id> <project-dir> --scout [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--service-tier <tier>] [--backend <name>]
+#        fm-spawn.sh <task-id> [<firstmate-home>] [--harness <name>|harness|launch-command] [--model <name>] [--effort <level>] [--service-tier <tier>] [--backend <name>] --secondmate
 #   --mode and --yolo are this task's delivery contract, REQUIRED for every ship
 #   spawn and refused on --scout and --secondmate spawns. Firstmate resolves both
 #   per task at intake (AGENTS.md section 7); data/projects.md holds the captain's
@@ -16,7 +16,7 @@
 #   loud one-line deviation notice is printed and the spawn continues.
 #   no-mistakes-prod-only is a registry policy rather than a task mode and is
 #   refused as a flag value.
-#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>]
+#        fm-spawn.sh <task-id> --relaunch [--harness <name>] [--model <name>] [--effort <level>] [--service-tier <tier>]
 #   --relaunch launches a replacement agent for an EXISTING task into that
 #   task's own recorded endpoint and worktree instead of creating either. It is
 #   the launch half of the control plane (bin/fm-control.sh relaunch), which
@@ -31,13 +31,32 @@
 #   agent-free on a backend with a recovery-grade agent-state classifier (tmux
 #   or herdr), refuses unless the endpoint's shell is sitting in the recorded
 #   worktree, and clears the previous harness's per-task wiring before arming
-#   the new incarnation.
+#   the new incarnation. The service tier travels with the harness axes, so a
+#   relaunch may change it the same way it may change model or effort.
 #   --harness <name> is the explicit per-spawn harness/profile adapter. The old
 #   positional harness arg still works for back-compat.
 #   --model <name> and --effort <low|medium|high|xhigh|max> are concrete profile
 #   axes chosen by firstmate at intake. They are only threaded into harnesses whose
 #   installed CLIs were verified to support that axis; unsupported axes are omitted
 #   from that harness's launch rather than guessed.
+#   codex is the exception that proves the rule for effort: its accepted set is
+#   per-MODEL, not per-harness, and an effort the resolved model does not support
+#   is a hard HTTP 400 on reasoning.effort that kills the run rather than being
+#   clamped. low|medium|high|xhigh are accepted by every catalog model, so they
+#   thread straight through; max is emitted only when the installed catalog
+#   positively advertises it for the requested model (codex_effort_in_catalog
+#   below). Anything that leaves that unproven - no codex on PATH, no jq, no
+#   explicit --model, an unreadable catalog - omits max exactly as before.
+#   --service-tier <default|priority> selects codex's paid speed tier per spawn.
+#   It exists because a service tier set in the OPERATOR's own ~/.codex/config.toml
+#   is inherited by every codex agent this script launches, so omitting the flag
+#   does NOT mean the tier is off - it means "whatever the operator configured".
+#   Turning the tier off therefore requires sending a value, which is why
+#   service_tier_flag_for_harness deliberately has no "!= default" guard: unlike
+#   --model/--effort, where default means "send nothing", `default` IS codex's
+#   own tier id for baseline speed and must reach the launch to override the
+#   operator's config. Not passing the flag at all is the inherit-the-operator
+#   case. See the harness-adapters skill's launch-profile axes table.
 #   --backend <name> is the explicit runtime session-provider backend for this
 #   exact task only (docs/configuration.md "Runtime backend" owns when that flag
 #   is authorized). Without it, the script resolves FM_BACKEND, then
@@ -149,6 +168,7 @@
 #     __PITURNEND__ absolute path to .pi/extensions/fm-primary-turnend-guard.ts in a pi secondmate home
 #     __PIWATCH__   absolute path to .pi/extensions/fm-primary-pi-watch.ts in a pi secondmate home
 #     __OPINPUT__   absolute path to the canonical operational-input encoder
+#     __SERVICETIERFLAG__ codex service-tier config override, empty for every other harness
 # Verified per-harness turn-end hooks are installed automatically where enabled; some live outside the worktree.
 # Kimi uses one surgically installed Firstmate region in $HOME/.kimi-code/config.toml,
 # a firstmate-owned global hook and registry, and a gitignored per-task pointer.
@@ -237,6 +257,8 @@ SUB_HOME_MARKER=".fm-secondmate-home"
 . "$SCRIPT_DIR/fm-trace-context-lib.sh"
 # shellcheck source=bin/fm-remote-readiness-lib.sh
 . "$SCRIPT_DIR/fm-remote-readiness-lib.sh"
+# shellcheck source=bin/fm-timeout-lib.sh
+. "$SCRIPT_DIR/fm-timeout-lib.sh"
 # Fail closed before any fleet mutation: a no-mistakes gate agent must never spawn
 # a direct report (see bin/fm-gate-refuse-lib.sh).
 fm_refuse_if_gate_agent
@@ -248,6 +270,7 @@ KIND_SET=0
 HARNESS_ARG=
 MODEL=
 EFFORT=
+SERVICE_TIER=
 BACKEND_ARG=
 MODE=
 YOLO=
@@ -255,6 +278,7 @@ TRACEPARENT_ARG=
 HARNESS_SET=0
 MODEL_SET=0
 EFFORT_SET=0
+SERVICE_TIER_SET=0
 BACKEND_SET=0
 MODE_SET=0
 YOLO_SET=0
@@ -271,6 +295,7 @@ for a in "$@"; do
       harness) HARNESS_ARG=$a; HARNESS_SET=1 ;;
       model) MODEL=$a; MODEL_SET=1 ;;
       effort) EFFORT=$a; EFFORT_SET=1 ;;
+      service-tier) SERVICE_TIER=$a; SERVICE_TIER_SET=1 ;;
       backend) BACKEND_ARG=$a; BACKEND_SET=1 ;;
       mode) MODE=$a; MODE_SET=1 ;;
       yolo) YOLO=$a; YOLO_SET=1 ;;
@@ -290,6 +315,8 @@ for a in "$@"; do
     --model=*) MODEL=${a#--model=}; MODEL_SET=1 ;;
     --effort) want_value=effort ;;
     --effort=*) EFFORT=${a#--effort=}; EFFORT_SET=1 ;;
+    --service-tier) want_value=service-tier ;;
+    --service-tier=*) SERVICE_TIER=${a#--service-tier=}; SERVICE_TIER_SET=1 ;;
     --backend) want_value=backend ;;
     --backend=*) BACKEND_ARG=${a#--backend=}; BACKEND_SET=1 ;;
     --mode) want_value=mode ;;
@@ -305,6 +332,7 @@ done
 [ "$HARNESS_SET" -eq 0 ] || [ -n "$HARNESS_ARG" ] || { echo "error: --harness requires a non-empty value" >&2; exit 1; }
 [ "$MODEL_SET" -eq 0 ] || [ -n "$MODEL" ] || { echo "error: --model requires a non-empty value" >&2; exit 1; }
 [ "$EFFORT_SET" -eq 0 ] || [ -n "$EFFORT" ] || { echo "error: --effort requires a non-empty value" >&2; exit 1; }
+[ "$SERVICE_TIER_SET" -eq 0 ] || [ -n "$SERVICE_TIER" ] || { echo "error: --service-tier requires a non-empty value" >&2; exit 1; }
 [ "$BACKEND_SET" -eq 0 ] || [ -n "$BACKEND_ARG" ] || { echo "error: --backend requires a non-empty value" >&2; exit 1; }
 [ "$MODE_SET" -eq 0 ] || [ -n "$MODE" ] || { echo "error: --mode requires a non-empty value" >&2; exit 1; }
 [ "$YOLO_SET" -eq 0 ] || [ -n "$YOLO" ] || { echo "error: --yolo requires a non-empty value" >&2; exit 1; }
@@ -325,6 +353,13 @@ fi
 case "$EFFORT" in
   ''|low|medium|high|xhigh|max) ;;
   *) echo "error: --effort must be one of low, medium, high, xhigh, max" >&2; exit 1 ;;
+esac
+# The accepted set is codex's own tier vocabulary, not an on/off synonym, because
+# the value is passed through verbatim to the harness. `default` is codex's
+# baseline tier and is how a spawn turns the operator's configured paid tier OFF.
+case "$SERVICE_TIER" in
+  ''|default|priority) ;;
+  *) echo "error: --service-tier must be one of default, priority" >&2; exit 1 ;;
 esac
 
 # --relaunch reuses an existing task's endpoint, worktree, project, and kind,
@@ -596,6 +631,9 @@ spawn_remote_secondmate() {
     echo "tasktmp="
     echo "model=${model#-}"
     echo "effort=${effort#-}"
+    # Recorded for traceability only. A remote secondmate home launches its own
+    # agents from its own config, so this spawn threads no launch flag there.
+    [ -z "$SERVICE_TIER" ] || echo "service_tier=$SERVICE_TIER"
     echo "home=$home"
     echo "projects=$(secondmate_registry_field "$DATA/secondmates.md" "$id" projects)"
     echo "remote_host=$host"
@@ -731,6 +769,7 @@ spawn_abort_cleanup() {
             echo "tasktmp=${TASK_TMP:-}"
             echo "model=${MODEL:-default}"
             echo "effort=${EFFORT:-default}"
+            [ -z "$SERVICE_TIER" ] || echo "service_tier=$SERVICE_TIER"
             echo "backend=orca"
             echo "orca_worktree_id=$ORCA_WORKTREE_ID"
             [ -z "${ORCA_TERMINAL:-}" ] || echo "terminal=$ORCA_TERMINAL"
@@ -839,6 +878,7 @@ if [ "${#POS[@]}" -gt 0 ] && [ "${POS[0]}" != "$idpart" ] && case "$idpart" in *
   [ -z "$HARNESS_ARG" ] || shared_args+=(--harness "$HARNESS_ARG")
   [ -z "$MODEL" ] || shared_args+=(--model "$MODEL")
   [ -z "$EFFORT" ] || shared_args+=(--effort "$EFFORT")
+  [ -z "$SERVICE_TIER" ] || shared_args+=(--service-tier "$SERVICE_TIER")
   [ -z "$BACKEND_ARG" ] || shared_args+=(--backend "$BACKEND_ARG")
   # One delivery contract applies to every pair in a batch, exactly like the shared
   # harness. Each pair still re-validates it against its own brief, so a batch
@@ -1063,9 +1103,9 @@ launch_template() {
     claude) printf '%s' 'CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false claude --dangerously-skip-permissions __MODELFLAG____EFFORTFLAG__"$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
     codex)
       if [ "$kind" = secondmate ]; then
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG____SERVICETIERFLAG__--dangerously-bypass-approvals-and-sandbox "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       else
-        printf '%s' 'codex __MODELFLAG____EFFORTFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
+        printf '%s' 'codex __MODELFLAG____EFFORTFLAG____SERVICETIERFLAG__--dangerously-bypass-approvals-and-sandbox -c "notify=[\"bash\",\"-c\",\"touch __TURNEND__\"]" "$(__OPINPUT__ encode launch-brief < __BRIEF__)"'
       fi
       ;;
     opencode) printf '%s' 'OPENCODE_CONFIG_CONTENT='\''{"permission":{"*":"allow"}}'\'' opencode __MODELFLAG__--prompt "$(__OPINPUT__ encode launch-brief < __BRIEF__)"' ;;
@@ -1289,8 +1329,26 @@ model_flag_for_harness() {
   esac
 }
 
+# Whether the installed codex catalog positively advertises an effort for a model.
+# The catalog, not this script, is the authority: codex ships `debug models` as
+# the supported read of it, so a model gaining or losing a level needs no edit
+# here. Every uncertain path returns non-zero (the caller then omits the flag),
+# because codex does NOT validate model_reasoning_effort against the catalog the
+# way it validates service_tier - it forwards the value and the API answers with
+# a 400 that kills the run.
+codex_effort_in_catalog() {
+  local model=$1 effort=$2
+  [ -n "$model" ] && [ "$model" != default ] || return 1
+  command -v codex >/dev/null 2>&1 || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  fm_run_timed 10 codex debug models 2>/dev/null \
+    | jq -e --arg m "$model" --arg e "$effort" \
+      'first(.models[]? | select(.slug == $m) | .supported_reasoning_levels[]? | select(.effort == $e)) // empty' \
+      >/dev/null 2>&1
+}
+
 effort_flag_for_harness() {
-  local harness=$1 effort=$2
+  local harness=$1 effort=$2 model=${3:-}
   [ -n "$effort" ] && [ "$effort" != default ] || return 0
   case "$harness" in
     claude)
@@ -1299,11 +1357,22 @@ effort_flag_for_harness() {
       esac
       ;;
     codex)
-      # The installed codex config schema uses model_reasoning_effort, and the
-      # bundled model catalog advertises low|medium|high|xhigh. Omit max rather
-      # than passing an unsupported value.
+      # The installed codex config schema uses model_reasoning_effort. Its
+      # accepted set is per-model rather than per-harness: low|medium|high|xhigh
+      # are advertised by every model in the catalog, while max is advertised by
+      # only some of them and codex's own ceiling has moved upward at least once.
+      # So the low..xhigh band threads straight through and max is proven against
+      # the catalog first - see codex_effort_in_catalog above for why an
+      # unprovable max is dropped rather than attempted. codex's levels above the
+      # shared low|medium|high|xhigh|max vocabulary stay unreachable, exactly as
+      # muse's levels below it do.
       case "$effort" in
         low|medium|high|xhigh) printf -- '-c %s ' "$(shell_quote "model_reasoning_effort=\"$effort\"")" ;;
+        max)
+          if codex_effort_in_catalog "$model" max; then
+            printf -- '-c %s ' "$(shell_quote "model_reasoning_effort=\"$effort\"")"
+          fi
+          ;;
       esac
       ;;
     grok)
@@ -1341,6 +1410,27 @@ effort_flag_for_harness() {
     # to a different, non-interactive launch mode, so fm-spawn does not pass it.
     # kimi likewise has no reasoning-effort flag; the requested axis stays in
     # task metadata but never reaches the launch command.
+  esac
+}
+
+# A service tier is a codex concept today, so every other harness records the
+# requested value in meta and receives no flag.
+#
+# DELIBERATE ASYMMETRY with model_flag_for_harness/effort_flag_for_harness: those
+# treat `default` as "caller expressed no preference" and emit nothing. Here an
+# EMPTY value is that case, and `default` is a real codex tier id that must reach
+# the launch. Emitting nothing for it would leave the agent on whatever tier the
+# operator's own ~/.codex/config.toml sets, which is the exact bug this axis
+# exists to fix. Do not add a `!= default` guard here.
+service_tier_flag_for_harness() {
+  local harness=$1 tier=$2
+  [ -n "$tier" ] || return 0
+  case "$harness" in
+    codex)
+      case "$tier" in
+        default|priority) printf -- '-c %s ' "$(shell_quote "service_tier=\"$tier\"")" ;;
+      esac
+      ;;
   esac
 }
 
@@ -2476,7 +2566,7 @@ fi
 preserve_relaunch_meta() {
   awk -F= '
     BEGIN {
-      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort busy_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
+      split("window endpoint_task_id worktree project harness kind mode yolo tasktmp model effort service_tier busy_gen traceparent backend herdr_session herdr_workspace_id herdr_tab_id herdr_pane_id zellij_session zellij_tab_id zellij_pane_id orca_worktree_id terminal cmux_workspace_id cmux_surface_id home projects control_relaunch_tx", keys, " ")
       for (i in keys) owned[keys[i]] = 1
     }
     !($1 in owned)
@@ -2494,6 +2584,12 @@ preserve_relaunch_meta() {
   echo "tasktmp=$TASK_TMP"
   echo "model=${MODEL:-default}"
   echo "effort=${EFFORT:-default}"
+  # Written only when the axis was actually requested. model=/effort= can spell
+  # "caller expressed no preference" as default because no harness has a level
+  # called default, but `default` IS a codex tier, so an always-written line
+  # could not tell "not requested" from "explicitly baseline speed". Absent
+  # service_tier= therefore means the agent inherited the operator's own setting.
+  [ -z "$SERVICE_TIER" ] || echo "service_tier=$SERVICE_TIER"
   [ -z "${BUSY_GEN:-}" ] || echo "busy_gen=$BUSY_GEN"
   # Default-off writes no traceparent= line.
   # backend= is written only for a non-default (non-tmux) backend, so the
@@ -2555,9 +2651,11 @@ sq_piturnend=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-turnend-guard.ts
 sq_piwatch=$(shell_quote "$PROJ_ABS/.pi/extensions/fm-primary-pi-watch.ts")
 sq_opinput=$(shell_quote "$FM_ROOT/bin/fm-operational-input.sh")
 MODELFLAG=$(model_flag_for_harness "$HARNESS" "$MODEL")
-EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT")
+EFFORTFLAG=$(effort_flag_for_harness "$HARNESS" "$EFFORT" "$MODEL")
+SERVICETIERFLAG=$(service_tier_flag_for_harness "$HARNESS" "$SERVICE_TIER")
 LAUNCH=${LAUNCH//__MODELFLAG__/$MODELFLAG}
 LAUNCH=${LAUNCH//__EFFORTFLAG__/$EFFORTFLAG}
+LAUNCH=${LAUNCH//__SERVICETIERFLAG__/$SERVICETIERFLAG}
 LAUNCH=${LAUNCH//__BRIEF__/$sq_brief}
 LAUNCH=${LAUNCH//__TURNEND__/$sq_turnend}
 LAUNCH=${LAUNCH//__PIEXT__/$sq_piext}

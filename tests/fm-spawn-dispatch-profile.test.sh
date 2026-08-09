@@ -14,7 +14,7 @@ SPAWN="$ROOT/bin/fm-spawn.sh"
 TMP_ROOT=$(fm_test_tmproot fm-spawn-dispatch-profile)
 
 make_spawn_fakebin() {
-  local dir=$1 fakebin
+  local dir=$1 fakebin real_jq
   fakebin=$(fm_fakebin "$dir")
   cat > "$fakebin/tmux" <<'SH'
 #!/usr/bin/env bash
@@ -42,6 +42,33 @@ esac
 exit 0
 SH
   chmod +x "$fakebin/tmux"
+  # codex's accepted effort set is per-model, so fm-spawn reads the installed
+  # catalog before it will emit max. Serve a fixed synthetic catalog here: these
+  # cases must assert the gate, not the operator's real codex installation, and
+  # a fixture naming real models would rot the moment the vendor moves a ceiling.
+  # FM_FAKE_CODEX_CATALOG_FAIL drives the unreadable-catalog path.
+  cat > "$fakebin/codex" <<'SH'
+#!/usr/bin/env bash
+set -u
+if [ "${1:-}" = debug ] && [ "${2:-}" = models ]; then
+  [ -z "${FM_FAKE_CODEX_CATALOG_FAIL:-}" ] || exit 1
+  cat <<'JSON'
+{"models":[
+  {"slug":"fm-test-max-model","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"},{"effort":"max"}]},
+  {"slug":"fm-test-capped-model","supported_reasoning_levels":[{"effort":"low"},{"effort":"medium"},{"effort":"high"},{"effort":"xhigh"}]}
+]}
+JSON
+  exit 0
+fi
+exit 0
+SH
+  chmod +x "$fakebin/codex"
+  real_jq=$(command -v jq 2>/dev/null) || fail "jq is required for the codex effort catalog tests"
+  cat > "$fakebin/jq" <<SH
+#!/usr/bin/env bash
+exec '$real_jq' "\$@"
+SH
+  chmod +x "$fakebin/jq"
   fm_fake_exit0 "$fakebin" treehouse pi-signed
   printf '%s\n' "$fakebin"
 }
@@ -398,21 +425,156 @@ test_codex_threads_model_and_effort() {
   pass "codex receives --model and model_reasoning_effort profile flags"
 }
 
-test_codex_omits_invalid_max_effort() {
+test_codex_threads_max_effort_the_catalog_advertises() {
   local rec id out status launch
-  id=profile-codex-max-z4
-  rec=$(make_spawn_case profile-codex-max codex "$id")
+  id=profile-codex-max-ok-z4
+  rec=$(make_spawn_case profile-codex-max-ok codex "$id")
   read_case_record "$rec"
 
-  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model gpt-5 --effort max)
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model fm-test-max-model --effort max)
   status=$?
-  expect_code 0 "$status" "codex spawn with unsupported max effort should omit the effort flag"
-  assert_meta_profile "$HOME_DIR/state/$id.meta" codex gpt-5 max
+  expect_code 0 "$status" "codex spawn with a catalog-advertised max effort should succeed"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex fm-test-max-model max
   launch=$(cat "$LAUNCH_LOG")
-  assert_contains "$launch" "codex --model 'gpt-5' --dangerously-bypass-approvals-and-sandbox" \
+  assert_contains "$launch" "codex --model 'fm-test-max-model' -c 'model_reasoning_effort=\"max\"' --dangerously-bypass-approvals-and-sandbox" \
+    "codex launch did not thread max reasoning effort for a model whose catalog advertises it"
+  pass "codex receives max reasoning effort when the catalog advertises it for the model"
+}
+
+test_codex_omits_max_effort_the_catalog_caps() {
+  local rec id out status launch
+  id=profile-codex-max-capped-z4b
+  rec=$(make_spawn_case profile-codex-max-capped codex "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model fm-test-capped-model --effort max)
+  status=$?
+  expect_code 0 "$status" "codex spawn with a max effort the model caps below should still launch"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex fm-test-capped-model max
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "codex --model 'fm-test-capped-model' --dangerously-bypass-approvals-and-sandbox" \
     "codex launch did not preserve the model flag when max effort was omitted"
-  assert_not_contains "$launch" "model_reasoning_effort" "codex launch must omit unsupported max reasoning effort"
-  pass "codex omits unsupported max effort instead of passing a bad config value"
+  assert_not_contains "$launch" "model_reasoning_effort" \
+    "codex launch must omit a max the model's catalog entry does not advertise"
+  pass "codex omits max effort for a model whose catalog caps below it"
+}
+
+# The catalog is the only proof that max is safe, so anything that removes it -
+# an unreadable catalog, no model to look up - has to fall back to omitting max
+# rather than attempting it. These two cases pin that direction of failure.
+test_codex_omits_max_effort_when_catalog_unreadable() {
+  local rec id out status launch
+  id=profile-codex-max-nocat-z4c
+  rec=$(make_spawn_case profile-codex-max-nocat codex "$id")
+  read_case_record "$rec"
+
+  out=$(FM_FAKE_CODEX_CATALOG_FAIL=1 run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model fm-test-max-model --effort max)
+  status=$?
+  expect_code 0 "$status" "codex spawn should still launch when the catalog cannot be read"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex fm-test-max-model max
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "model_reasoning_effort" \
+    "codex launch must omit max when the catalog cannot confirm it"
+  pass "codex omits max effort when the catalog cannot be read"
+}
+
+test_codex_omits_max_effort_without_an_explicit_model() {
+  local rec id out status launch
+  id=profile-codex-max-nomodel-z4d
+  rec=$(make_spawn_case profile-codex-max-nomodel codex "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --effort max)
+  status=$?
+  expect_code 0 "$status" "codex spawn with max effort and no model should still launch"
+  assert_meta_profile "$HOME_DIR/state/$id.meta" codex default max
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "model_reasoning_effort" \
+    "codex launch must omit max when no model names the catalog entry to check"
+  pass "codex omits max effort when no explicit model can be checked against the catalog"
+}
+
+test_codex_threads_service_tier() {
+  local rec id out status launch
+  id=profile-codex-tier-z4e
+  rec=$(make_spawn_case profile-codex-tier codex "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model fm-test-max-model --service-tier priority)
+  status=$?
+  expect_code 0 "$status" "codex spawn with a service tier should succeed"
+  assert_grep "service_tier=priority" "$HOME_DIR/state/$id.meta" "meta missing service_tier=priority"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "codex --model 'fm-test-max-model' -c 'service_tier=\"priority\"' --dangerously-bypass-approvals-and-sandbox" \
+    "codex launch did not thread the service tier config override"
+  pass "codex receives the requested service tier as a config override"
+}
+
+# The point of the axis: turning the tier off has to SEND default, because the
+# operator's own codex config supplies a tier to every launch that says nothing.
+# An omitted flag would silently keep paying for the operator's tier.
+test_codex_default_service_tier_is_sent_not_omitted() {
+  local rec id out status launch
+  id=profile-codex-tier-off-z4f
+  rec=$(make_spawn_case profile-codex-tier-off codex "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model fm-test-max-model --service-tier default)
+  status=$?
+  expect_code 0 "$status" "codex spawn turning the service tier off should succeed"
+  assert_grep "service_tier=default" "$HOME_DIR/state/$id.meta" "meta missing service_tier=default"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_contains "$launch" "-c 'service_tier=\"default\"'" \
+    "codex launch must SEND the baseline tier to override the operator's own config, not omit the flag"
+  pass "codex sends the baseline service tier instead of omitting the flag"
+}
+
+test_no_service_tier_leaves_the_axis_untouched() {
+  local rec id out status launch
+  id=profile-codex-tier-absent-z4g
+  rec=$(make_spawn_case profile-codex-tier-absent codex "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model fm-test-max-model)
+  status=$?
+  expect_code 0 "$status" "codex spawn without a service tier should succeed"
+  assert_no_grep "service_tier=" "$HOME_DIR/state/$id.meta" \
+    "an unrequested service tier must not be recorded, because default is a real tier value"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "service_tier" \
+    "codex launch must not mention a service tier that was never requested"
+  pass "an unrequested service tier reaches neither the launch nor the record"
+}
+
+test_service_tier_is_recorded_but_not_threaded_for_other_harnesses() {
+  local rec id out status launch
+  id=profile-claude-tier-z4h
+  rec=$(make_spawn_case profile-claude-tier claude "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model sonnet --service-tier priority)
+  status=$?
+  expect_code 0 "$status" "a service tier on a non-codex harness should not fail the spawn"
+  assert_grep "service_tier=priority" "$HOME_DIR/state/$id.meta" \
+    "meta must record a requested service tier even when the harness cannot use it"
+  launch=$(cat "$LAUNCH_LOG")
+  assert_not_contains "$launch" "service_tier" \
+    "a harness with no service tier concept must not receive the flag"
+  pass "a service tier requested for a non-codex harness is recorded but never threaded"
+}
+
+test_invalid_service_tier_is_refused() {
+  local rec id out status
+  id=profile-codex-tier-bad-z4i
+  rec=$(make_spawn_case profile-codex-tier-bad codex "$id")
+  read_case_record "$rec"
+
+  out=$(run_ship_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --model fm-test-max-model --service-tier turbo)
+  status=$?
+  expect_code 1 "$status" "an unknown service tier should be refused rather than guessed"
+  assert_contains "$out" "--service-tier must be one of default, priority" \
+    "refusal did not name the accepted service tiers"
+  pass "an unknown service tier is refused at intake"
 }
 
 test_grok_threads_model_and_reasoning_effort() {
@@ -685,7 +847,15 @@ test_active_dispatch_profile_allows_positional_harness
 test_active_dispatch_profile_allows_raw_launch_command
 test_claude_threads_model_and_effort
 test_codex_threads_model_and_effort
-test_codex_omits_invalid_max_effort
+test_codex_threads_max_effort_the_catalog_advertises
+test_codex_omits_max_effort_the_catalog_caps
+test_codex_omits_max_effort_when_catalog_unreadable
+test_codex_omits_max_effort_without_an_explicit_model
+test_codex_threads_service_tier
+test_codex_default_service_tier_is_sent_not_omitted
+test_no_service_tier_leaves_the_axis_untouched
+test_service_tier_is_recorded_but_not_threaded_for_other_harnesses
+test_invalid_service_tier_is_refused
 test_grok_threads_model_and_reasoning_effort
 test_grok_omits_invalid_max_reasoning_effort
 test_grok_omits_invalid_xhigh_reasoning_effort
