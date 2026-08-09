@@ -354,6 +354,44 @@ test_no_mistakes_dod_wording() {
   pass "fm-brief.sh: no-mistakes DOD keeps its apostrophe prose, now parse-safe"
 }
 
+# The PR description contract belongs only to the modes that produce a PR. A
+# local-only ship and a scout deliverable have no PR to describe, so the block
+# must be absent there rather than shipped as dead guidance.
+test_pr_description_contract_only_on_pr_modes() {
+  local home id brief
+  home="$TMP_ROOT/pr-description-home"
+  mkdir -p "$home/data"
+
+  for id_mode in "brief-prdesc-nm:--mode no-mistakes" "brief-prdesc-dpr:--mode direct-PR"; do
+    id=${id_mode%%:*}
+    # shellcheck disable=SC2086 # the fixture flags are deliberately word-split
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj ${id_mode##*:} >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$id: brief was not scaffolded"
+    assert_grep "Write the PR description for a reader who has not read the plan." "$brief" \
+      "$id: PR-producing brief lost the PR description contract"
+    assert_grep "one plain-English sentence saying what this change lets us do that we could not do before" "$brief" \
+      "$id: PR description contract lost its plain-English opening sentence"
+    assert_grep "one line on what the change deliberately does not do" "$brief" \
+      "$id: PR description contract lost the deliberate-non-goal line"
+    assert_grep "that material moves down, it is never cut" "$brief" \
+      "$id: PR description contract must move caveats below rather than cut them"
+    assert_grep "knows from the first two lines alone what changed and why they should care" "$brief" \
+      "$id: PR description contract lost its reader test"
+  done
+
+  for id_mode in "brief-prdesc-lo:--mode local-only" "brief-prdesc-scout:--scout"; do
+    id=${id_mode%%:*}
+    # shellcheck disable=SC2086 # the fixture flags are deliberately word-split
+    FM_HOME="$home" "$ROOT/bin/fm-brief.sh" "$id" some-proj ${id_mode##*:} >/dev/null 2>&1
+    brief="$home/data/$id/brief.md"
+    assert_present "$brief" "$id: brief was not scaffolded"
+    assert_no_grep "Write the PR description for a reader who has not read the plan." "$brief" \
+      "$id: brief produces no PR but carried the PR description contract"
+  done
+  pass "fm-brief.sh: the PR description contract ships only with PR-producing briefs"
+}
+
 test_ship_project_memory_wording() {
   local home id brief
   home="$TMP_ROOT/project-memory-home"
@@ -719,6 +757,7 @@ test_ship_mode_is_explicit_not_registry
 test_delivery_flags_are_refused_where_they_do_not_apply
 test_faster_paths_use_configured_authority_without_stacked_review
 test_no_mistakes_dod_wording
+test_pr_description_contract_only_on_pr_modes
 test_ship_project_memory_wording
 test_herdr_lab_contract_is_explicit_and_complete
 test_herdr_lab_contract_quotes_foreign_firstmate_path
